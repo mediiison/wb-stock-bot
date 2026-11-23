@@ -389,16 +389,38 @@ def build_bot():
 
     @dp.message(Command("start"))
     async def start_handler(message: Message):
+        # /start всегда отвечает: иначе неверный TG_CHAT_ID выглядит как поломка polling.
+        LOG.info("Получена /start из chat_id=%s; chat_id настроен=%s",
+                 message.chat.id, chat_id is not None)
         if chat_id is not None and message.chat.id != chat_id:
+            await message.answer(
+                f"Бот на связи. ID этого чата: {message.chat.id}. "
+                "Он не совпадает с TG_CHAT_ID в настройках Bothost; "
+                "проверки доступны только для указанного чата."
+            )
             return
-        await message.answer("Монитор остатков WB. /check_now — проверить сейчас. "
-                             "Автопроверка — ежедневно в 10:00 МСК. "
-                             f"ID этого чата: {message.chat.id}. "
-                             "Укажите его в TG_CHAT_ID, чтобы включить мониторинг.")
+        await message.answer(
+            "Монитор остатков WB. /check_now — проверить сейчас. "
+            "Автопроверка — ежедневно в 10:00 МСК. "
+            f"ID этого чата: {message.chat.id}. "
+            + ("TG_CHAT_ID не задан — укажите этот ID в настройках хостинга."
+               if chat_id is None else "Мониторинг для этого чата включён.")
+        )
 
     @dp.message(Command("check_now"))
     async def manual_handler(message: Message):
-        if chat_id is None or message.chat.id != chat_id:
+        LOG.info("Получена /check_now из chat_id=%s", message.chat.id)
+        if chat_id is None:
+            await message.answer(
+                f"Мониторинг ещё не настроен: TG_CHAT_ID отсутствует. "
+                f"ID этого чата: {message.chat.id}."
+            )
+            return
+        if message.chat.id != chat_id:
+            await message.answer(
+                f"Проверка недоступна для этого чата (ID: {message.chat.id}). "
+                "Проверьте TG_CHAT_ID в настройках Bothost."
+            )
             return
         # Не блокируем обработку команд во время выгрузки WB.
         asyncio.create_task(check(chat_id, manual=True))
