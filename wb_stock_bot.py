@@ -417,9 +417,10 @@ def build_bot():
                           replace_existing=True, coalesce=True,
                           max_instances=1, misfire_grace_time=300)
         try:
-            # Сначала подготовим Telegram: при 429 будем ждать внутри процесса,
-            # а не падать и не провоцировать новые перезапуски от Bothost.
-            await prepare_polling(bot)
+            # Не вызываем getWebhookInfo/deleteWebhook при каждом запуске:
+            # при Telegram 429 эти запросы мешали даже начать polling.
+            # Если webhook действительно включён, getUpdates сообщит о конфликте.
+            LOG.info("Запускаем polling без предварительных запросов к webhook")
             scheduler.start()
             LOG.info("Следующая проверка: %s",
                      scheduler.get_job("daily_wb_check").next_run_time)
@@ -434,11 +435,11 @@ def build_bot():
                     delay = max(1, int(e.retry_after)) + 2
                     LOG.warning("Telegram 429 при polling; ждём %s сек", delay)
                     await asyncio.sleep(delay)
-                except TelegramConflictError:
-                    # Два процесса с одним BOT_TOKEN конкурируют за getUpdates.
-                    LOG.error("Другой экземпляр бота использует тот же токен. "
-                              "Остановите дубликат. Повтор через 30 сек")
-                    await asyncio.sleep(30)
+                except TelegramConflictError as e:
+                    # Конфликт может означать другой getUpdates или установленный webhook.
+                    LOG.error("Telegram getUpdates конфликт: %s. Проверьте, что "
+                              "другой polling остановлен и webhook отключён.", e)
+                    await asyncio.sleep(60)
                 except (TelegramNetworkError, TelegramServerError) as e:
                     LOG.warning("Telegram: %s; повтор через 15 сек", type(e).__name__)
                     await asyncio.sleep(15)
