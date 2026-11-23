@@ -484,8 +484,17 @@ def build_bot():
                     LOG.warning("Polling остановился; повторный запуск через 5 сек")
                     await asyncio.sleep(5)
                 except TelegramRetryAfter as e:
-                    delay = max(1, int(e.retry_after)) + 2
-                    LOG.warning("Telegram 429 при polling; ждём %s сек", delay)
+                    # Логируем точный метод Telegram API: без него нельзя
+                    # различить лимит getMe, getUpdates или другого запроса.
+                    method = type(getattr(e, "method", None)).__name__
+                    retry_after = max(1, int(e.retry_after))
+                    # Не создаём постоянный цикл повторных запусков каждые 30 сек.
+                    delay = max(retry_after + 5, 180)
+                    LOG.warning(
+                        "Telegram 429: метод=%s, retry_after=%s сек; "
+                        "пауза перед повтором=%s сек. Подробности: %s",
+                        method, retry_after, delay, str(e)[:280]
+                    )
                     await asyncio.sleep(delay)
                 except TelegramConflictError as e:
                     LOG.error("Telegram getUpdates конфликт: %s", e)
