@@ -481,34 +481,53 @@ def build_bot():
                           replace_existing=True, coalesce=True,
                           max_instances=1, misfire_grace_time=300)
         try:
-            LOG.info("Запускаем polling; подписчиков: %d", len(get_subscribers()))
+            LOG.info("Запускаем Telegram getUpdates с учётом retry_after; подписчиков: %d", len(get_subscribers()))
             scheduler.start()
             LOG.info("Следующая проверка: %s",
                      scheduler.get_job("daily_wb_check").next_run_time)
+            # Встроенный _listen_updates() aiogram при TelegramRetryAfter
+            # повторяет запросы каждые 1–5 секунд, игнорируя retry_after.
+            # Используем официальный getUpdates напрямую и передаём
+            # сообщения в aiogram через поддерживаемый feed_update().
+            offset = None
+            LOG.info("Получение сообщений Telegram через getUpdates запущено")
             while True:
                 try:
-                    await dp.start_polling(bot, handle_signals=False,
-                                           close_bot_session=False)
-                    LOG.warning("Polling остановился; повторный запуск через 5 сек")
-                    await asyncio.sleep(5)
+                    updates = await bot.get_updates(
+                        offset=offset,
+                        timeout=30,
+                        allowed_updates=["message"],
+                        request_timeout=45,
+                    )
+                    for update in updates:
+                        try:
+                            await dp.feed_update(bot, update)
+                        except Exception:
+                            LOG.exception("Ошибка обработки Telegram update_id=%s",
+                                          update.update_id)
+                        # Следующий getUpdates подтвердит обработанные сообщения.
+                        offset = update.update_id + 1
                 except TelegramRetryAfter as e:
-                    # Логируем точный метод Telegram API: без него нельзя
-                    # различить лимит getMe, getUpdates или другого запроса.
-                    method = type(getattr(e, "method", None)).__name__
-                    retry_after = max(1, int(e.retry_after))
-                    # Не создаём постоянный цикл повторных запусков каждые 30 сек.
-                    delay = max(retry_after + 5, 180)
+                    delay = max(1, int(e.retry_after)) + 2
                     LOG.warning(
-                        "Telegram 429: метод=%s, retry_after=%s сек; "
-                        "пауза перед повтором=%s сек. Подробности: %s",
-                        method, retry_after, delay, str(e)[:280]
+                        "Telegram 429: метод=%s; строго ждём %s сек "
+                        "(retry_after=%s) перед новым запросом",
+                        type(getattr(e, "method", None)).__name__,
+                        delay, e.retry_after,
                     )
                     await asyncio.sleep(delay)
                 except TelegramConflictError as e:
-                    LOG.error("Telegram getUpdates конфликт: %s", e)
+                    LOG.error(
+                        "Telegram getUpdates: конфликт другого polling "
+                        "или действующего webhook: %s", e
+                    )
                     await asyncio.sleep(60)
-                except (TelegramNetworkError, TelegramServerError) as e:
-                    LOG.warning("Telegram: %s; повтор через 15 сек", type(e).__name__)
+                except TelegramUnauthorizedError:
+                    LOG.exception("Telegram-токен недействителен; polling остановлен")
+                    raise
+                except (TelegramNetworkError, TelegramServerError, asyncio.TimeoutError) as e:
+                    LOG.warning("Telegram: %s; повтор через 15 сек",
+                                type(e).__name__)
                     await asyncio.sleep(15)
         finally:
             if scheduler.running:
