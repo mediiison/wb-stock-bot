@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 from aiogram import Bot, Dispatcher
+from aiogram.types import User
 from aiogram.exceptions import (TelegramRetryAfter, TelegramConflictError,
                                 TelegramNetworkError, TelegramServerError,
                                 TelegramUnauthorizedError)
@@ -390,6 +391,13 @@ def build_bot():
         raise RuntimeError("Задайте BOT_TOKEN и WB_TOKEN")
     subscriber_store()
     bot = Bot(token=bot_token)
+    # aiogram перед getUpdates вызывает getMe для получения имени бота.
+    # Telegram ограничил именно GetMe (429); ID бота уже есть в токене.
+    # Кэшируем только минимальную техническую информацию, чтобы не
+    # выполнять заблокированный GetMe при каждом запуске процесса.
+    # Это обход старта, а НЕ снятие ограничений Telegram с других методов.
+    bot._me = User(id=bot.id, is_bot=True, first_name="WB Monitor")
+    LOG.info("GetMe пропущен: идентификатор бота взят из Telegram-токена")
     dp = Dispatcher()
     check_lock = asyncio.Lock()
     last_manual_check = 0.0
