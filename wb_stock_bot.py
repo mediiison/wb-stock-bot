@@ -1,7 +1,7 @@
 """Мониторинг WB FBO/FBS -> Telegram, ежедневно в 10:00 МСК.
 
 Установка: pip install 'aiogram>=3,<4' 'APScheduler>=3.10,<4' requests
-Конфигурация: WB_TOKEN, BOT_TOKEN, TG_CHAT_ID в переменных окружения.
+Конфигурация: WB_TOKEN и BOT_TOKEN в переменных окружения. Доступ всем пользователям.
 В Colab: import wb_stock_bot; wb_stock_bot.start_colab() (не блокирует ячейку).
 На сервере: python wb_stock_bot.py
 """
@@ -9,6 +9,7 @@ import asyncio
 import io
 import logging
 import os
+import sqlite3
 import threading
 import time
 from collections import Counter, defaultdict
@@ -351,85 +352,118 @@ async def prepare_polling(bot):
             await asyncio.sleep(15)
 
 
+def subscriber_db_path():
+    """Сохраняем подписчиков на диске Bothost, а не в оперативной памяти."""
+    folder = os.getenv("DATA_DIR") or "."
+    os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, "wb_subscribers.sqlite3")
+
+
+def subscriber_store():
+    """Создать таблицу при первом запуске."""
+    path = subscriber_db_path()
+    with sqlite3.connect(path, timeout=15) as db:
+        db.execute("CREATE TABLE IF NOT EXISTS subscribers (chat_id INTEGER PRIMARY KEY)")
+    return path
+
+
+def add_subscriber(chat_id):
+    with sqlite3.connect(subscriber_db_path(), timeout=15) as db:
+        db.execute("INSERT OR IGNORE INTO subscribers(chat_id) VALUES (?)", (int(chat_id),))
+
+
+def remove_subscriber(chat_id):
+    with sqlite3.connect(subscriber_db_path(), timeout=15) as db:
+        db.execute("DELETE FROM subscribers WHERE chat_id = ?", (int(chat_id),))
+
+
+def get_subscribers():
+    with sqlite3.connect(subscriber_db_path(), timeout=15) as db:
+        return [x[0] for x in db.execute("SELECT chat_id FROM subscribers").fetchall()]
+
+
 def build_bot():
-    # Название BOT_TOKEN оставляем прежним: уже задано на Bothost.
+    # Бот доступен всем: TG_CHAT_ID больше не используется для ограничения доступа.
     bot_token = config("BOT_TOKEN")
     wb_token = config("WB_TOKEN")
-    chat_raw = config("TG_CHAT_ID")
     if not bot_token or not wb_token:
         raise RuntimeError("Задайте BOT_TOKEN и WB_TOKEN")
-    chat_id = int(chat_raw) if chat_raw else None
+    subscriber_store()
     bot = Bot(token=bot_token)
     dp = Dispatcher()
     check_lock = asyncio.Lock()
+    last_manual_check = 0.0
 
-    async def check(chat, manual=False):
+    async def notify(chat_ids, text):
+        for chat_id in chat_ids:
+            try:
+                await bot.send_message(chat_id, text)
+            except Exception:
+                LOG.exception("Не удалось отправить сообщение чату %s", chat_id)
+
+    async def check(chat_ids, manual=False):
+        nonlocal last_manual_check
         if check_lock.locked():
             if manual:
-                await bot.send_message(chat, "Проверка уже выполняется.")
+                await notify(chat_ids, "Проверка уже выполняется.")
             return
+        if manual:
+            # Защита WB API от частых проверок любым пользователем.
+            delay = 900 - (time.monotonic() - last_manual_check)
+            if delay > 0:
+                await notify(chat_ids, "Проверку можно повторить через %d мин." %
+                             max(1, int((delay + 59) // 60)))
+                return
+            last_manual_check = time.monotonic()
         async with check_lock:
             try:
                 full, rows, start, end = await asyncio.to_thread(collect_report, wb_token)
                 LOG.info("Проверено %d SKU; найдено %d совпадений", len(full), len(rows))
                 if not rows:
-                    # По требованию молчим, в том числе при ручном запуске.
+                    # Файл не отправляем, когда совпадений нет.
                     return
                 data = make_csv(rows)
                 name = "wb_zero_stock_" + end.strftime("%Y%m%d_%H%M") + ".csv"
-                await bot.send_document(chat, BufferedInputFile(data, filename=name),
-                                        caption="Внимание: остаток 0, но есть продажи!")
+                for chat_id in chat_ids:
+                    try:
+                        await bot.send_document(
+                            chat_id, BufferedInputFile(data, filename=name),
+                            caption="Внимание: остаток 0, но есть продажи!"
+                        )
+                    except Exception:
+                        LOG.exception("Не удалось отправить файл чату %s", chat_id)
             except Exception as e:
                 LOG.exception("Проверка WB завершилась ошибкой")
-                # Ошибку направляем только владельцу бота, не раскрывая токены.
-                try:
-                    await bot.send_message(chat, f"Ошибка проверки Wildberries: {str(e)[:300]}")
-                except Exception:
-                    LOG.exception("Не удалось уведомить Telegram об ошибке")
+                await notify(chat_ids, f"Ошибка проверки Wildberries: {str(e)[:300]}")
 
     @dp.message(Command("start"))
     async def start_handler(message: Message):
-        # /start всегда отвечает: иначе неверный TG_CHAT_ID выглядит как поломка polling.
-        LOG.info("Получена /start из chat_id=%s; chat_id настроен=%s",
-                 message.chat.id, chat_id is not None)
-        if chat_id is not None and message.chat.id != chat_id:
-            await message.answer(
-                f"Бот на связи. ID этого чата: {message.chat.id}. "
-                "Он не совпадает с TG_CHAT_ID в настройках Bothost; "
-                "проверки доступны только для указанного чата."
-            )
-            return
+        add_subscriber(message.chat.id)
+        LOG.info("Подписан чат %s", message.chat.id)
         await message.answer(
-            "Монитор остатков WB. /check_now — проверить сейчас. "
-            "Автопроверка — ежедневно в 10:00 МСК. "
-            f"ID этого чата: {message.chat.id}. "
-            + ("TG_CHAT_ID не задан — укажите этот ID в настройках хостинга."
-               if chat_id is None else "Мониторинг для этого чата включён.")
+            "Монитор остатков Wildberries включён для этого чата. "
+            "Ежедневная проверка — в 10:00 МСК. "
+            "/check_now — проверить сейчас, /stop — отключить уведомления. "
+            "Если нет товаров с нулевым остатком и продажами от 2 шт., файл не отправляется."
         )
+
+    @dp.message(Command("stop"))
+    async def stop_handler(message: Message):
+        remove_subscriber(message.chat.id)
+        await message.answer("Ежедневные уведомления отключены. /start — включить снова.")
 
     @dp.message(Command("check_now"))
     async def manual_handler(message: Message):
-        LOG.info("Получена /check_now из chat_id=%s", message.chat.id)
-        if chat_id is None:
-            await message.answer(
-                f"Мониторинг ещё не настроен: TG_CHAT_ID отсутствует. "
-                f"ID этого чата: {message.chat.id}."
-            )
-            return
-        if message.chat.id != chat_id:
-            await message.answer(
-                f"Проверка недоступна для этого чата (ID: {message.chat.id}). "
-                "Проверьте TG_CHAT_ID в настройках Bothost."
-            )
-            return
+        LOG.info("Получена /check_now из чата %s", message.chat.id)
         # Не блокируем обработку команд во время выгрузки WB.
-        asyncio.create_task(check(chat_id, manual=True))
+        asyncio.create_task(check([message.chat.id], manual=True))
 
     async def scheduled():
-        if chat_id is None:
-            LOG.error("TG_CHAT_ID не задан, отправка невозможна")
+        chats = get_subscribers()
+        if not chats:
+            LOG.info("Подписчиков нет: ежедневная выгрузка пропущена")
             return
-        await check(chat_id)
+        await check(chats)
 
     async def run():
         start_health_server_if_needed()
@@ -439,16 +473,12 @@ def build_bot():
                           replace_existing=True, coalesce=True,
                           max_instances=1, misfire_grace_time=300)
         try:
-            # Не вызываем getWebhookInfo/deleteWebhook при каждом запуске:
-            # при Telegram 429 эти запросы мешали даже начать polling.
-            # Если webhook действительно включён, getUpdates сообщит о конфликте.
-            LOG.info("Запускаем polling без предварительных запросов к webhook")
+            LOG.info("Запускаем polling; подписчиков: %d", len(get_subscribers()))
             scheduler.start()
             LOG.info("Следующая проверка: %s",
                      scheduler.get_job("daily_wb_check").next_run_time)
             while True:
                 try:
-                    # Dispatcher сам повторяет большинство сетевых ошибок polling.
                     await dp.start_polling(bot, handle_signals=False,
                                            close_bot_session=False)
                     LOG.warning("Polling остановился; повторный запуск через 5 сек")
@@ -458,9 +488,7 @@ def build_bot():
                     LOG.warning("Telegram 429 при polling; ждём %s сек", delay)
                     await asyncio.sleep(delay)
                 except TelegramConflictError as e:
-                    # Конфликт может означать другой getUpdates или установленный webhook.
-                    LOG.error("Telegram getUpdates конфликт: %s. Проверьте, что "
-                              "другой polling остановлен и webhook отключён.", e)
+                    LOG.error("Telegram getUpdates конфликт: %s", e)
                     await asyncio.sleep(60)
                 except (TelegramNetworkError, TelegramServerError) as e:
                     LOG.warning("Telegram: %s; повтор через 15 сек", type(e).__name__)
