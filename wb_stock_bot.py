@@ -18,13 +18,13 @@ from zoneinfo import ZoneInfo
 
 import requests
 import xlsxwriter
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.types import User
 from aiogram.exceptions import (TelegramRetryAfter, TelegramConflictError,
                                 TelegramNetworkError, TelegramServerError,
                                 TelegramUnauthorizedError)
 from aiogram.filters import Command
-from aiogram.types import BufferedInputFile, Message
+from aiogram.types import BufferedInputFile, KeyboardButton, Message, ReplyKeyboardMarkup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 MOSCOW = ZoneInfo("Europe/Moscow")
@@ -437,6 +437,10 @@ def build_bot():
     dp = Dispatcher()
     check_lock = asyncio.Lock()
     last_manual_check = 0.0
+    monthly_button = "Отчёт за 30 дней"
+    report_keyboard = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=monthly_button)]], resize_keyboard=True
+    )
 
     async def notify(chat_ids, text):
         for chat_id in chat_ids:
@@ -488,7 +492,8 @@ def build_bot():
             "Ежедневная проверка — в 10:00 МСК. "
             "/check_now — проверить за сутки, /month — получить Excel за 30 дней, "
             "/stop — отключить уведомления. "
-            "Если нет товаров с нулевым остатком и продажами от 2 шт., файл не отправляется."
+            "Если нет товаров с нулевым остатком и продажами от 2 шт., файл не отправляется.",
+            reply_markup=report_keyboard,
         )
 
     @dp.message(Command("stop"))
@@ -507,7 +512,10 @@ def build_bot():
             await message.answer("Проверка WB уже выполняется. Повтори команду после её завершения.")
             return
         async with check_lock:
-            await message.answer("Запрашиваю свежие остатки и выкупы за последние 30 дней.")
+            await message.answer(
+                "Запрашиваю свежие остатки и выкупы за последние 30 дней.",
+                reply_markup=report_keyboard,
+            )
             try:
                 _, rows, start, end = await asyncio.to_thread(collect_report, wb_token, monthly=True)
                 if not rows:
@@ -525,6 +533,7 @@ def build_bot():
                 await message.answer("Не удалось подготовить месячный отчёт WB. Попробуй ещё раз позже.")
 
     @dp.message(Command("month"))
+    @dp.message(F.text == monthly_button)
     async def monthly_handler(message: Message):
         asyncio.create_task(send_monthly_report(message))
 
