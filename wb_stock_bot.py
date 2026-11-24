@@ -1,6 +1,6 @@
 """Мониторинг WB FBO/FBS -> Telegram, ежедневно в 10:00 МСК.
 
-Установка: pip install 'aiogram>=3,<4' 'APScheduler>=3.10,<4' requests
+Установка: pip install 'aiogram>=3,<4' 'APScheduler>=3.10,<4' requests xlsxwriter
 Конфигурация: WB_TOKEN и BOT_TOKEN в переменных окружения. Доступ всем пользователям.
 В Colab: import wb_stock_bot; wb_stock_bot.start_colab() (не блокирует ячейку).
 На сервере: python wb_stock_bot.py
@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
+import xlsxwriter
 from aiogram import Bot, Dispatcher
 from aiogram.types import User
 from aiogram.exceptions import (TelegramRetryAfter, TelegramConflictError,
@@ -123,6 +124,7 @@ class WBClient:
                         if sku in catalog and catalog[sku]["nmId"] != nm:
                             raise WBError(f"Один barcode привязан к разным nmId: {sku}")
                         catalog[sku] = {"sku": sku, "nmId": nm, "name": title,
+                                        "article": str(card.get("vendorCode") or ""),
                                         "chrtId": int(chrt) if chrt else None}
                         if chrt:
                             chrt_to_skus[int(chrt)].add(sku)
@@ -220,71 +222,84 @@ class WBClient:
                  len(warehouses), len(totals))
         return totals, bool(warehouses)
 
-    def sales(self, start, end):
-        """Два календарных дня с flag=1, затем точный фильтр последних 24 часов.
-        Так не теряются продажи из-за фильтра по lastChangeDate вместо date.
-        ВАЖНО: метод Sales ограничен 1 запросом/мин для персонального токена.
-        """
-        result = Counter()
-        seen = set()
-        day = start.date()
-        while day <= end.date():
-            rows = self.request("GET", WB_STATS + "/api/v1/supplier/sales",
-                                params={"dateFrom": day.isoformat(), "flag": 1},
-                                interval=61)
+    def sale_rows(self, start, end, monthly):
+        url = WB_STATS + "/api/v1/supplier/sales"
+        if not monthly:
+            day = start.date()
+            while day <= end.date():
+                rows = self.request("GET", url, params={"dateFrom": day.isoformat(), "flag": 1},
+                                    interval=61)
+                if not isinstance(rows, list):
+                    raise WBError("Неверный формат статистики продаж")
+                yield from rows
+                day += timedelta(days=1)
+            return
+
+        cursor = start.replace(tzinfo=None).isoformat(timespec="seconds")
+        while True:
+            rows = self.request("GET", url, params={"dateFrom": cursor, "flag": 0}, interval=61)
             if not isinstance(rows, list):
                 raise WBError("Неверный формат статистики продаж")
-            for row in rows:
-                sid = str(row.get("saleID") or "")
-                # Только выкупы: возвраты помечаются R..., а не S...
-                if not sid.startswith("S"):
-                    continue
-                stamp = row.get("date")
-                if not stamp:
-                    continue
-                try:
-                    sold_at = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-                    sold_at = sold_at.replace(tzinfo=MOSCOW) if sold_at.tzinfo is None else sold_at.astimezone(MOSCOW)
-                except ValueError:
-                    LOG.warning("Пропущена некорректная дата продажи")
-                    continue
-                if not (start <= sold_at <= end):
-                    continue
-                unique = sid  # saleID идентифицирует операцию продажи
-                if unique in seen:
-                    continue
-                seen.add(unique)
+            if not rows:
+                return
+            next_cursor = rows[-1].get("lastChangeDate")
+            if not isinstance(next_cursor, str) or next_cursor <= cursor:
+                raise WBError("Wildberries не вернул следующий курсор продаж")
+            yield from rows
+            cursor = next_cursor
+
+    def sales(self, start, end, *, monthly=False):
+        result, seen = Counter(), set()
+        for row in self.sale_rows(start, end, monthly):
+            sale_id = str(row.get("saleID") or "")
+            if not sale_id.startswith("S") or sale_id in seen:
+                continue
+            stamp = row.get("date")
+            if not stamp:
+                continue
+            try:
+                sold_at = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+            except ValueError:
+                LOG.warning("Пропущена некорректная дата продажи")
+                continue
+            if sold_at.tzinfo is None:
+                sold_at = sold_at.replace(tzinfo=MOSCOW)
+            if start <= sold_at <= end:
+                seen.add(sale_id)
                 barcode = str(row.get("barcode") or "").strip()
                 if barcode:
                     result[barcode] += 1
-                else:
-                    LOG.warning("Продажа %s без barcode пропущена", sid)
-            day += timedelta(days=1)
-        LOG.info("Продажи за 24 часа: %d шт., %d barcode", sum(result.values()), len(result))
+        LOG.info("Продажи за период: %d шт., %d barcode", sum(result.values()), len(result))
         return result
 
 
-def collect_report(token):
+def collect_report(token, *, monthly=False):
     """Возвращает полный список остатков и продаж, а также отфильтрованные строки."""
     wb = WBClient(token)
     end = datetime.now(MOSCOW)
-    start = end - timedelta(hours=24)
     cards, chrt_to_skus = wb.cards()
     if not cards:
         raise WBError("Не найдены карточки: нельзя достоверно сопоставить SKU и остатки")
     fbo = wb.fbo()
     fbs, fbs_enabled = wb.fbs(chrt_to_skus)
-    sales = wb.sales(start, end)
+    if monthly:
+        end = datetime.now(MOSCOW)
+    start = end - timedelta(days=30 if monthly else 1)
+    sales = wb.sales(start, end, monthly=monthly)
     full = []
     for sku, card in cards.items():
         if card["chrtId"] is None and fbs_enabled:
             raise WBError(f"Нет chrtId у SKU {sku}; остатки FBS нельзя проверить")
-        record = {"sku": sku, "name": card["name"], "fbo": fbo[sku],
-                  "fbs": fbs[sku], "sales": sales[sku]}
+        record = {"sku": sku, "name": card["name"], "article": card.get("article", ""),
+                  "fbo": fbo[sku], "fbs": fbs[sku] if fbs_enabled or not monthly else None,
+                  "sales": sales[sku]}
         full.append(record)
     # Ноль хотя бы в одном используемом канале: FBO или (при наличии складов) FBS.
     filtered = [r for r in full if r["sales"] >= 2 and
-                (r["fbo"] <= 0 or (fbs_enabled and r["fbs"] <= 0))]
+                (r["fbo"] == 0 or r["fbs"] == 0)] if monthly else [
+                    r for r in full if r["sales"] >= 2 and
+                    (r["fbo"] <= 0 or (fbs_enabled and r["fbs"] <= 0))
+                ]
     filtered.sort(key=lambda r: (-r["sales"], r["sku"]))
     return full, filtered, start, end
 
@@ -302,6 +317,27 @@ def make_csv(rows):
             return "'" + text if text.lstrip().startswith(("=", "+", "-", "@")) else text
         writer.writerow([safe(row["sku"]), safe(row["name"]), row["fbo"], row["fbs"], row["sales"]])
     return output.getvalue().encode("utf-8-sig")
+
+
+def make_monthly_excel(rows, start, end):
+    output = io.BytesIO()
+    with xlsxwriter.Workbook(output, {"in_memory": True, "strings_to_formulas": False,
+                                       "strings_to_urls": False}) as workbook:
+        sheet = workbook.add_worksheet("Нулевые остатки")
+        header = workbook.add_format({"bold": True, "bg_color": "#E5DDFA"})
+        sheet.write_string(0, 0, f"Остатки на {end:%d.%m.%Y %H:%M} МСК")
+        sheet.write_string(1, 0, f"Выкупы с {start:%d.%m.%Y %H:%M} до {end:%d.%m.%Y %H:%M} МСК")
+        sheet.write_row(3, 0, ["Артикул продавца", "Баркод", "Название",
+                               "Остаток FBO", "Остаток FBS", "Выкупы за 30 дней"], header)
+        for index, row in enumerate(rows, 4):
+            sheet.write_row(index, 0, [row[key] for key in
+                                       ("article", "sku", "name", "fbo", "fbs", "sales")])
+        sheet.set_column(0, 1, 23)
+        sheet.set_column(2, 2, 50)
+        sheet.set_column(3, 5, 19)
+        sheet.freeze_panes(4, 0)
+        sheet.autofilter(3, 0, 3 + len(rows), 5)
+    return output.getvalue()
 
 
 def start_health_server_if_needed():
@@ -411,9 +447,8 @@ def build_bot():
 
     async def check(chat_ids, manual=False):
         nonlocal last_manual_check
-        if check_lock.locked():
-            if manual:
-                await notify(chat_ids, "Проверка уже выполняется.")
+        if manual and check_lock.locked():
+            await notify(chat_ids, "Проверка уже выполняется.")
             return
         if manual:
             # Защита WB API от частых проверок любым пользователем.
@@ -451,7 +486,8 @@ def build_bot():
         await message.answer(
             "Монитор остатков Wildberries включён для этого чата. "
             "Ежедневная проверка — в 10:00 МСК. "
-            "/check_now — проверить сейчас, /stop — отключить уведомления. "
+            "/check_now — проверить за сутки, /month — получить Excel за 30 дней, "
+            "/stop — отключить уведомления. "
             "Если нет товаров с нулевым остатком и продажами от 2 шт., файл не отправляется."
         )
 
@@ -465,6 +501,32 @@ def build_bot():
         LOG.info("Получена /check_now из чата %s", message.chat.id)
         # Не блокируем обработку команд во время выгрузки WB.
         asyncio.create_task(check([message.chat.id], manual=True))
+
+    async def send_monthly_report(message):
+        if check_lock.locked():
+            await message.answer("Проверка WB уже выполняется. Повтори команду после её завершения.")
+            return
+        async with check_lock:
+            await message.answer("Запрашиваю свежие остатки и выкупы за последние 30 дней.")
+            try:
+                _, rows, start, end = await asyncio.to_thread(collect_report, wb_token, monthly=True)
+                if not rows:
+                    await message.answer("Позиций с нулевым остатком и двумя или более выкупами нет.")
+                    return
+                data = await asyncio.to_thread(make_monthly_excel, rows, start, end)
+                name = f"wb_zero_stock_month_{end:%Y%m%d_%H%M}.xlsx"
+                await message.answer_document(
+                    BufferedInputFile(data, filename=name),
+                    caption=f"Нулевые остатки FBO или FBS · выкупы за 30 дней\n"
+                            f"Позиций: {len(rows)}\nОстатки проверены {end:%d.%m.%Y в %H:%M} МСК",
+                )
+            except Exception:
+                LOG.exception("Месячный отчёт WB завершился ошибкой")
+                await message.answer("Не удалось подготовить месячный отчёт WB. Попробуй ещё раз позже.")
+
+    @dp.message(Command("month"))
+    async def monthly_handler(message: Message):
+        asyncio.create_task(send_monthly_report(message))
 
     async def scheduled():
         chats = get_subscribers()
